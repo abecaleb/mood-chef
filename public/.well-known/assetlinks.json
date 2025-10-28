@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "app.moodchef",
+      "sha256_cert_fingerprints": [
+        "D6:9A:3E:EA:AD:45:8D:0F:D9:27:A6:13:63:60:F1:B8:37:7D:1A:FB:BCD"
+      ]
+    }
+  }
+]

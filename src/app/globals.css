@@ -1,8 +1,6 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
-/* Warm vignette similar to premium landing pages */
+/* optional backdrop */
 body {
   background-image:
     radial-gradient(1200px 300px at 50% 0%, rgba(253, 230, 138, 0.35), rgba(255,255,255,0));

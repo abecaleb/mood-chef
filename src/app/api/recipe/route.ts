@@ -6,7 +6,7 @@ const schema = z.object({
   mood: z.string().trim().min(1),
   minutes: z.coerce.number().int().positive().max(240),
   ingredients: z.string().trim().min(1),
-  diet: z.string().trim().optional(), // e.g., vegetarian, vegan, keto, paleo, gluten-free, dairy-free, halal, kosher
+  diet: z.string().trim().optional(),
 });
 
 const SPOON = "https://api.spoonacular.com";
@@ -14,23 +14,24 @@ const API_KEY = process.env.SPOONACULAR_API_KEY!;
 
 export async function POST(req: NextRequest) {
   try {
-    if (!API_KEY) {
-      return json({ error: "SPOONACULAR_API_KEY missing" }, 500);
-    }
+    if (!API_KEY) return json({ error: "SPOONACULAR_API_KEY missing" }, 500);
 
     const body = await req.json();
     const { mood, minutes, ingredients, diet } = schema.parse(body);
 
-    const { dietParam, intolerances } = mapDiet(diet);
     const ingCsv = normIngredientsCSV(ingredients);
+    const userIngsRaw = splitCsv(ingCsv);
+    const userIngs = userIngsRaw.map(normalizeIng);
 
-    // 1) Find candidates that actually use the given ingredients
+    const { dietParam, intolerances } = mapDiet(diet);
+
+    // 1) Find recipes that ACTUALLY use the given ingredients
     const findParams = new URLSearchParams({
       apiKey: API_KEY,
       ingredients: ingCsv,
-      number: "8",          // grab a handful to filter
-      ranking: "1",         // maximize used ingredients
-      ignorePantry: "true", // salt/oil/etc assumed available
+      number: "16",
+      ranking: "1",          // maximize used ingredients
+      ignorePantry: "true",
     });
 
     const resFind = await fetch(`${SPOON}/recipes/findByIngredients?${findParams}`, { cache: "no-store" });
@@ -38,49 +39,62 @@ export async function POST(req: NextRequest) {
       const text = await resFind.text();
       return json({ error: `findByIngredients failed: ${resFind.status} ${text}` }, 502);
     }
-
-    const candidates: any[] = await resFind.json();
+    let candidates: any[] = await resFind.json();
     if (!Array.isArray(candidates) || candidates.length === 0) {
       return json({ error: "No recipes found with your ingredients." }, 404);
     }
 
-    // Sort: most used ingredients first, then fewest missed
-    candidates.sort((a, b) => {
-      const usedDiff = (b.usedIngredientCount ?? 0) - (a.usedIngredientCount ?? 0);
-      if (usedDiff !== 0) return usedDiff;
-      return (a.missedIngredientCount ?? 0) - (b.missedIngredientCount ?? 0);
+    // Compute overlap count (how many of the user’s items are used)
+    candidates = candidates.map(r => {
+      const used = (r.usedIngredients ?? [])
+        .map((i: any) => normalizeIng(i.name ?? i.original ?? ""));
+      const overlap = userIngs.filter(i => used.includes(i));
+      return { ...r, overlapCount: overlap.length, _overlapSet: new Set(overlap) };
     });
 
-    // 2) Pull /information for each candidate to filter by time & diet
-    const filtered: any[] = [];
-    for (const c of candidates) {
+    // Prefer recipes that use ALL inputs first; then fall back to ≥2
+    const requireAll = userIngs.length >= 2; // with 3 provided, require all 3 first
+    let strict = requireAll
+      ? candidates.filter(r => r.overlapCount === userIngs.length)
+      : candidates.filter(r => r.overlapCount >= 1);
+
+    // If none use all, fall back to ≥2; if still none, fall back to original ranking
+    if (strict.length === 0) strict = candidates.filter(r => r.overlapCount >= Math.min(2, userIngs.length));
+    if (strict.length === 0) strict = candidates;
+
+    // Rank: most overlap, then fewest missed, then most used
+    strict.sort((a, b) =>
+      (b.overlapCount - a.overlapCount) ||
+      ((a.missedIngredientCount ?? 0) - (b.missedIngredientCount ?? 0)) ||
+      ((b.usedIngredientCount ?? 0) - (a.usedIngredientCount ?? 0))
+    );
+
+    // 2) Pull /information for top few and filter by time + diet/intolerances
+    const finalists: { hit: any; info: any }[] = [];
+    for (const c of strict.slice(0, 8)) {
       const infoUrl = new URL(`${SPOON}/recipes/${c.id}/information`);
       infoUrl.searchParams.set("apiKey", API_KEY);
       infoUrl.searchParams.set("includeNutrition", "false");
+
       const infoRes = await fetch(infoUrl, { cache: "no-store" });
       if (!infoRes.ok) continue;
       const info = await infoRes.json();
 
-      // Time filter
       const ready = info?.readyInMinutes ?? c.readyInMinutes ?? 999;
       if (ready > minutes) continue;
-
-      // Diet/intolerance filter (best-effort)
       if (!passesDiet(info, dietParam, intolerances)) continue;
 
-      filtered.push({ hit: c, info });
-      if (filtered.length >= 3) break; // keep it snappy
+      finalists.push({ hit: c, info });
+      if (finalists.length >= 3) break;
     }
 
-    // If none passed strict filters, relax to top candidate anyway
-    const pick = filtered[0] ?? (candidates.length ? { hit: candidates[0], info: null } : null);
-    if (!pick) {
-      return json({ error: "No suitable recipe matched your time/diet filters." }, 404);
-    }
+    const pick = finalists[0] ?? { hit: strict[0], info: null };
+    if (!pick) return json({ error: "No suitable recipe matched your filters." }, 404);
 
-    // 3) Get nice step-by-step instructions
+    // 3) Nice step-by-step instructions
     const id = pick.hit.id;
     const instRes = await fetch(`${SPOON}/recipes/${id}/analyzedInstructions?apiKey=${API_KEY}`, { cache: "no-store" });
+
     let steps: string[] = [];
     if (instRes.ok) {
       const inst = await instRes.json();
@@ -90,29 +104,34 @@ export async function POST(req: NextRequest) {
     }
 
     const info = pick.info;
-    const title = info?.title ?? pick.hit.title ?? "Recipe";
-    const time_minutes = Math.min(info?.readyInMinutes ?? pick.hit.readyInMinutes ?? minutes, minutes);
-    const serves = info?.servings ?? 2;
+    const baseTitle: string = info?.title ?? pick.hit.title ?? "Recipe";
 
-    const ingredients_list = buildIngredientList(pick.hit, info);
+    // === HERO TITLE: front-load user's ingredients ===
+    const usedSet = new Set<string>((pick.hit.usedIngredients ?? []).map((i: any) => normalizeIng(i.name ?? i.original ?? "")));
+    const heroParts = userIngsRaw
+      .filter((_, idx) => usedSet.has(userIngs[idx])) // keep only those actually used
+      .map(titleCase);
+    const heroPrefix = heroParts.length ? `${heroParts.join(" • ")} — ` : "";
+    const title = `${heroPrefix}${baseTitle}`;
+
+    const time_minutes: number = Math.min(info?.readyInMinutes ?? pick.hit.readyInMinutes ?? minutes, minutes);
+    const serves: number = info?.servings ?? 2;
+
+    // Ingredients list: put user's ingredients first
+    const ingredients_list = orderIngredientsForHero(
+      buildIngredientList(pick.hit, info),
+      userIngs
+    );
+
     if (steps.length === 0) {
       const fallback = extractStepsFromHtml(info?.summary || info?.instructions || "");
       steps = fallback.length ? fallback : ["Open the linked recipe page and follow the instructions."];
     }
 
-    const why_it_fits = buildWhy(mood, time_minutes, ingCsv, diet);
+    const why_it_fits = buildWhy(mood, time_minutes, ingCsv, diet, pick.hit, userIngs.length);
     const variation = buildVariation(pick.hit, info);
 
-    return json({
-      title,
-      time_minutes,
-      serves,
-      ingredients_list,
-      steps,
-      why_it_fits,
-      variation,
-    });
-
+    return json({ title, time_minutes, serves, ingredients_list, steps, why_it_fits, variation });
   } catch (err: any) {
     return json({ error: err?.message ?? "Bad Request" }, 400);
   }
@@ -127,20 +146,32 @@ function json(obj: any, status = 200) {
   });
 }
 
+function splitCsv(csv: string) {
+  return csv.split(",").map(s => s.trim()).filter(Boolean);
+}
+
 function normIngredientsCSV(s: string) {
   return s
-    .split(/[,;\n ]+/) // split by comma/semicolon/newline/space
+    .split(/[,;\n ]+/) // commas, semicolons, newlines, spaces
     .map(v => v.trim())
     .filter(Boolean)
     .slice(0, 20)
     .join(",");
 }
 
+function normalizeIng(s: string) {
+  // crude singularization + lowercase for better matching ("potatoes" -> "potato")
+  return s.toLowerCase().replace(/[^a-z\s]/g, "").replace(/(es|s)\b/g, "").trim();
+}
+
+function titleCase(s: string) {
+  return s.replace(/\b[a-z]/g, m => m.toUpperCase());
+}
+
 function mapDiet(raw?: string): { dietParam: string; intolerances: string[] } {
   if (!raw) return { dietParam: "", intolerances: [] };
   const s = raw.toLowerCase();
 
-  // Spoonacular "diet" enum
   const dietParam =
     s.includes("vegan") ? "vegan" :
     s.includes("vegetarian") ? "vegetarian" :
@@ -151,7 +182,6 @@ function mapDiet(raw?: string): { dietParam: string; intolerances: string[] } {
     s.includes("whole30") ? "whole30" :
     "";
 
-  // Intolerances (Spoonacular recognized)
   const intolerances: string[] = [];
   if (s.includes("gluten")) intolerances.push("gluten");
   if (s.includes("dairy") || s.includes("lactose")) intolerances.push("dairy");
@@ -170,7 +200,6 @@ function mapDiet(raw?: string): { dietParam: string; intolerances: string[] } {
 function passesDiet(info: any, dietParam: string, intolerances: string[]): boolean {
   if (!info) return true;
 
-  // Basic booleans from /information
   if (dietParam === "vegan" && info.vegan === false) return false;
   if (dietParam === "vegetarian" && info.vegetarian === false) return false;
   if (dietParam === "pescetarian" && !hasDiet(info, "pescatarian")) return false;
@@ -179,13 +208,11 @@ function passesDiet(info: any, dietParam: string, intolerances: string[]): boole
   if (dietParam === "low FODMAP" && !hasDiet(info, "low fodmap")) return false;
   if (dietParam === "whole30" && !hasDiet(info, "whole 30")) return false;
 
-  // Intolerances best-effort check via extendedIngredients
   if (Array.isArray(info.extendedIngredients) && intolerances.length) {
     const lowerList = info.extendedIngredients.map((i: any) =>
       (i?.original ?? i?.name ?? "").toString().toLowerCase()
     );
     for (const t of intolerances) {
-      // extremely rough matching to signal likely conflicts
       if (t === "gluten" && lowerList.some((x: string) => /(wheat|barley|rye|farro|spelt|semolina|bulgur)/.test(x))) return false;
       if (t === "dairy" && lowerList.some((x: string) => /(milk|cheese|butter|cream|yogurt)/.test(x))) return false;
       if (t === "peanut" && lowerList.some((x: string) => /\bpeanut\b/.test(x))) return false;
@@ -221,6 +248,19 @@ function buildIngredientList(hit: any, info: any): string[] {
   return out.length ? out : [];
 }
 
+function orderIngredientsForHero(list: string[], userIngsNorm: string[]) {
+  // bring user's ingredients (in any form) to the top
+  const norm = (s: string) => normalizeIng(s);
+  const isUser = (s: string) => userIngsNorm.includes(norm(s));
+  const users = list.filter(isUser);
+  const others = list.filter(i => !isUser(i));
+  return [...dedupe(users), ...others];
+}
+
+function dedupe(arr: string[]) {
+  return Array.from(new Set(arr));
+}
+
 function extractStepsFromHtml(html: string): string[] {
   if (!html) return [];
   const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
@@ -231,13 +271,18 @@ function extractStepsFromHtml(html: string): string[] {
   return parts.slice(0, 10);
 }
 
-function buildWhy(mood: string, time: number, ingCsv: string, diet?: string) {
-  const top = ingCsv.split(",").slice(0, 5).join(", ");
-  const more = ingCsv.split(",").length > 5 ? "…" : "";
+function buildWhy(mood: string, time: number, ingCsv: string, diet?: string, hit?: any, totalProvided?: number) {
+  const ingArr = splitCsv(ingCsv);
+  const top = ingArr.slice(0, 5).join(", ");
+  const more = ingArr.length > 5 ? "…" : "";
+
+  const usedCount = hit?.overlapCount ?? hit?.usedIngredientCount ?? 0;
+  const total = totalProvided ?? ingArr.length;
+
   return [
     `Matches your mood: ${mood}.`,
     `Fits your time (~${time} min).`,
-    ingCsv ? `Uses your ingredients: ${top}${more}.` : "",
+    `Uses ${usedCount}/${total} of your ingredients: ${top}${more}.`,
     diet ? `Diet preference: ${diet}.` : "",
   ].filter(Boolean).join(" ");
 }

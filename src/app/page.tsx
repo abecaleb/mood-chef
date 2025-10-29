@@ -20,7 +20,7 @@ const MOODS: { label: Mood; icon: string }[] = [
   { label: "Light & Simple", icon: "🌱" },
 ];
 
-// purely visual (not sent to backend for now)
+// Visual only (not sent to backend yet)
 const CUISINES = [
   { label: "Italian", flag: "🇮🇹" },
   { label: "Mexican", flag: "🇲🇽" },
@@ -71,29 +71,31 @@ export default function Home() {
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-b from-amber-50 to-white">
+    <main className="min-h-screen bg-gradient-to-b from-amber-50 via-white to-white">
       {/* HERO */}
       <header className="max-w-4xl mx-auto px-5 pt-12 pb-8 text-center">
         <div className="inline-flex items-center gap-3 mb-4">
           <Image
             src="/moodchef-logo.svg"
             alt="MoodChef logo"
-            width={40}
-            height={40}
-            className="rounded-lg ring-1 ring-black/5"
+            width={44}
+            height={44}
+            className="rounded-xl ring-1 ring-black/5"
             priority
           />
-          <h1 className="text-4xl sm:text-5xl font-black tracking-tight text-slate-800">
-            What’s for Dinner?
+          <h1 className="text-4xl sm:text-5xl font-black tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-amber-600 to-orange-500">
+            MoodChef
           </h1>
         </div>
-        <p className="text-slate-600 max-w-2xl mx-auto">
-          Curated recipes with <span className="font-semibold">smart ingredient matching</span>.
-          Tell us what you’ve got—we’ll find something delicious that fits your time and vibe.
+        <p className="text-slate-600 max-w-2xl mx-auto leading-relaxed">
+          What’s for dinner, made easy. Tell us your{" "}
+          <span className="font-medium text-slate-700">ingredients</span>,{" "}
+          <span className="font-medium text-slate-700">mood</span>, and{" "}
+          <span className="font-medium text-slate-700">time</span> — we’ll find a recipe that fits your vibe.
         </p>
       </header>
 
-      {/* CARD */}
+      {/* FORM CARD */}
       <section className="max-w-4xl mx-auto px-5 pb-16">
         <form
           onSubmit={onSubmit}
@@ -103,7 +105,7 @@ export default function Home() {
           <FieldHeader icon="🍴" title="What ingredients do you have?" />
           <input
             className="w-full mt-2 mb-2 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-800 placeholder-slate-400 shadow-sm focus:outline-none focus:ring-4 focus:ring-amber-200"
-            placeholder="e.g., chicken, tomatoes, pasta"
+            placeholder="e.g., potatoes, pumpkin, spinach"
             value={ingredients}
             onChange={(e) => setIngredients(e.target.value)}
             required
@@ -188,9 +190,9 @@ export default function Home() {
           <button
             type="submit"
             disabled={loading}
-            className="mt-7 w-full rounded-2xl bg-amber-500 text-white font-semibold py-3.5 shadow-sm hover:bg-amber-600 focus:outline-none focus:ring-4 focus:ring-amber-200 disabled:opacity-60"
+            className="mt-7 w-full rounded-2xl bg-gradient-to-r from-amber-500 to-orange-500 text-white font-semibold py-3.5 shadow-md hover:from-amber-600 hover:to-orange-600 focus:outline-none focus:ring-4 focus:ring-amber-200 transition-all disabled:opacity-60"
           >
-            {loading ? "Finding something tasty…" : "Find My Recipe! 🔎"}
+            {loading ? "Finding something tasty…" : "Find My Recipe 🍳"}
           </button>
 
           {/* ERRORS / RESULT */}

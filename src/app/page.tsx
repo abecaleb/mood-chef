@@ -17,24 +17,24 @@ export async function POST(req: Request) {
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-    // 🧠 System prompt tuned for cuisine + ingredient fidelity
-    const system = `You are "MoodChef", a helpful, creative recipe assistant.
-- Always fit prep+cook time within the given minutes.
-- Use the listed ingredients (plus common pantry basics like salt, pepper, oil, sugar).
-- If 'onlyThese' is true, avoid adding any other key ingredients.
-- If a cuisine is given, stay faithful to its flavors, cooking methods, and naming conventions.
-- Provide clear steps, quantities, and optionally a quick variation.
+    const system = `You are "MoodChef", a friendly, practical recipe assistant.
+- Always fit prep+cook within the given minutes.
+- Use only the provided ingredients plus pantry basics (oil, salt, pepper, common spices).
+- If "onlyThese" is true, avoid adding ingredients not listed (except pantry basics).
+- Prefer dishes that match the specified cuisine if provided.
+- Offer clear steps, quantities, and a quick variation.
 - If constraints are impossible, propose the closest feasible option.`;
 
-    // 🧾 Construct the user message
     const user = [
       `Mood: ${mood}`,
-      `Time available: ${minutes} minutes`,
-      `Ingredients: ${ingredients}`,
-      diet ? `Dietary preference: ${diet}` : "",
-      onlyThese ? `Constraint: Use only these ingredients (plus pantry staples)` : "",
-      cuisine ? `Cuisine focus: ${cuisine}` : "",
-    ].join("\n");
+      `Time available (minutes): ${minutes}`,
+      `Ingredients on hand: ${ingredients}`,
+      diet ? `Dietary preferences: ${diet}` : "",
+      cuisine ? `Cuisine preference: ${cuisine}` : "",
+      onlyThese ? `Restriction: Use ONLY these ingredients (apart from pantry staples).` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -43,8 +43,7 @@ export async function POST(req: Request) {
         { role: "system", content: system },
         {
           role: "user",
-          content: `Create ONE recipe that fits the brief.
-Return JSON in this format:
+          content: `Create ONE recipe that fits this brief. Return JSON only:
 {
   "title": "...",
   "time_minutes": <number>,
@@ -54,22 +53,32 @@ Return JSON in this format:
   "why_it_fits": "...",
   "variation": "..."
 }
-\n\nBrief:\n${user}`,
+
+Brief:
+${user}`,
         },
       ],
     });
 
-    // Parse JSON safely (strip markdown if model adds it)
-    const text = completion.choices[0]?.message?.content?.trim() ?? "{}";
-    const clean = text.replace(/```json|```/g, "");
-    return new Response(clean, {
+    // Sanitize and parse JSON safely
+    const raw = completion.choices[0]?.message?.content ?? "{}";
+    const text = raw
+      .replace(/```json/i, "")
+      .replace(/```/g, "")
+      .trim();
+
+    return new Response(text, {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
   } catch (err: any) {
+    console.error("❌ Error in /api/recipe:", err);
     return new Response(
-      JSON.stringify({ error: err.message ?? "Bad Request" }),
-      { status: 400, headers: { "Content-Type": "application/json" } }
+      JSON.stringify({ error: err.message ?? "Something went wrong" }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
     );
   }
 }

@@ -20,10 +20,11 @@ export async function POST(req: Request) {
 
     const system = `You are "MoodChef", a helpful, creative recipe assistant.
 - Fit total time within the given minutes.
-- Use listed ingredients (+ pantry basics: salt, pepper, oil, sugar).
-- If 'onlyThese' is true, avoid adding other key ingredients.
-- If a cuisine is provided, keep flavours & methods consistent with that cuisine.
-- Return only valid JSON in the requested shape.`;
+- Always use the provided ingredients prominently.
+- If 'onlyThese' is true, avoid adding any other major ingredients (besides pantry staples like salt, oil, pepper, sugar, spices).
+- If 'onlyThese' is false, you may add other *common complementary ingredients* that make sense with the given items.
+- If a cuisine is provided, keep flavours and methods true to that cuisine.
+- Always return valid JSON with title, time_minutes, serves, ingredients_list, steps, why_it_fits, and variation.`;
 
     const user = [
       `Mood: ${mood}`,

@@ -153,9 +153,6 @@ export default function Home() {
               />
               <span className="text-sm text-slate-700 leading-relaxed">
                 <span className="font-semibold">I have only these ingredients</span>{" "}
-                <span className="text-slate-500">
-                  (apart from pantry staples like salt, oil, pepper, sugar, chilli)
-                </span>
               </span>
             </label>
           </div>

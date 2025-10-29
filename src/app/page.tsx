@@ -64,7 +64,21 @@ export default function Page() {
     setRecipes([]);
     setSelectedIdx(null);
     setLoading(true);
+
+    // 🔹 Session cache key
+    const cacheKey = JSON.stringify({ ingredients, mood, diet, minutes, onlyThese, cuisine });
+    const cached = typeof window !== "undefined" ? sessionStorage.getItem(cacheKey) : null;
+    if (cached) {
+      setRecipes(JSON.parse(cached));
+      setLoading(false);
+      return;
+    }
+
     try {
+      // 🔹 12s client timeout
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 12000);
+
       const res = await fetch("/api/recipe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -76,7 +90,8 @@ export default function Page() {
           onlyThese,
           cuisine: cuisine || undefined,
         }),
-      });
+        signal: ac.signal,
+      }).finally(() => clearTimeout(timer));
 
       if (!res.ok) {
         let friendly = "Something went wrong. Please try again.";
@@ -94,9 +109,16 @@ export default function Page() {
 
       const json = (await res.json()) as RecipeResponse | Recipe;
       const list = "recipes" in json ? (json as RecipeResponse).recipes : [json as Recipe];
+
+      // 🔹 cache this exact query in-session
+      sessionStorage.setItem(cacheKey, JSON.stringify(list));
       setRecipes(list);
     } catch (err: any) {
-      setError(err.message || "Something went wrong. Please try again.");
+      if (err?.name === "AbortError") {
+        setError("That took too long. Please try again or tweak your inputs.");
+      } else {
+        setError(err.message || "Something went wrong. Please try again.");
+      }
     } finally {
       setLoading(false);
     }
@@ -117,11 +139,11 @@ export default function Page() {
             className="rounded-xl ring-1 ring-black/5"
             priority
           />
-          <h1 className="text-4xl sm:text-5xl font-black tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-amber-600 to-orange-500">
-            MoodChef
-          </h1>
         </div>
-        <p className="text-slate-600 max-w-2xl mx-auto leading-relaxed">
+        <h1 className="text-4xl sm:text-5xl font-black tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-amber-600 to-orange-500">
+          MoodChef
+        </h1>
+        <p className="mt-2 text-slate-600 max-w-2xl mx-auto leading-relaxed">
           What’s for dinner, made easy. Tell us your{" "}
           <span className="font-medium text-slate-700">ingredients</span>,{" "}
           <span className="font-medium text-slate-700">mood</span>, and{" "}

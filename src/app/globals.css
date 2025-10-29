@@ -1,9 +1,8 @@
-/* src/app/globals.css */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-/* Subtle vignette at top of page */
+/* Warm vignette similar to premium landing pages */
 body {
   background-image:
     radial-gradient(1200px 300px at 50% 0%, rgba(253, 230, 138, 0.35), rgba(255,255,255,0));

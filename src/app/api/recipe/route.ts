@@ -25,8 +25,9 @@ export async function POST(req: Request) {
 - Generate 2 unique recipes that fit the brief below.
 - Recipes in batch ${index} must differ from earlier ones.
 - Each recipe must fit within ${minutes} minutes and include the key ingredients.
-- Use JSON format: {"recipes":[{title,time_minutes,serves,ingredients_list[],steps[],why_it_fits,variation},...]}.
-- Keep steps ≤6 and ingredient names short.`;
+- Keep steps ≤6 and ingredient names short.
+- Return STRICT JSON: {"recipes":[{title,time_minutes,serves,ingredients_list[],steps[],why_it_fits,variation},...]}.
+- No extra commentary.`;
 
     const brief = [
       `Mood: ${mood}`,
@@ -43,38 +44,41 @@ export async function POST(req: Request) {
       openai.chat.completions.create({
         model: "gpt-4o-mini",
         temperature: 0.7,
+        // If this ever throws in your SDK version, remove response_format and keep the JSON.parse guard below.
         response_format: { type: "json_object" },
-        max_output_tokens: 650,
+        max_tokens: 650, // ✅ correct param name
         messages: [
           { role: "system", content: system(batch) },
           {
             role: "user",
             content:
               `Create exactly 2 different recipes that fit this brief.\n` +
-              `Return STRICT JSON only.\n\nBrief:\n${brief}`,
+              `Return STRICT JSON only (no markdown fences).\n\nBrief:\n${brief}`,
           },
         ],
       });
 
-    // 🔹 Run two calls in parallel
+    // Run two calls in parallel for speed
     const [res1, res2] = await Promise.allSettled([makeCall(1), makeCall(2)]);
 
     const parse = (r: any) => {
       try {
         const txt = r?.value?.choices?.[0]?.message?.content?.trim() ?? "{}";
-        return JSON.parse(txt.replace(/```json|```/g, ""));
+        const clean = txt.replace(/```json|```/g, "");
+        const obj = JSON.parse(clean);
+        return Array.isArray(obj?.recipes) ? obj : { recipes: [] };
       } catch {
         return { recipes: [] };
       }
     };
 
-    const recipesA = res1.status === "fulfilled" ? parse(res1).recipes || [] : [];
-    const recipesB = res2.status === "fulfilled" ? parse(res2).recipes || [] : [];
+    const recipesA = res1.status === "fulfilled" ? parse(res1).recipes : [];
+    const recipesB = res2.status === "fulfilled" ? parse(res2).recipes : [];
 
-    // 🔹 Merge and de-dupe by title
+    // Merge + de-dupe by title
     const seen = new Set<string>();
     const merged = [...recipesA, ...recipesB].filter((r) => {
-      const t = r?.title?.trim().toLowerCase();
+      const t = (r?.title || "").toString().trim().toLowerCase();
       if (!t || seen.has(t)) return false;
       seen.add(t);
       return true;
@@ -88,15 +92,16 @@ export async function POST(req: Request) {
     const msg = String(err?.message || "").toLowerCase();
     let status = 500;
     let error = "Something went wrong. Please try again in a moment.";
+
     if (msg.includes("402") || msg.includes("429") || msg.includes("quota") || msg.includes("limit")) {
       status = 429;
-      error =
-        "We’ve hit today’s recipe lookup limit. Please try again later or tweak your inputs.";
+      error = "We’ve hit today’s recipe lookup limit. Please try again later or tweak your inputs.";
     }
     if (msg.includes("zod") || msg.includes("invalid") || msg.includes("parse")) {
       status = 400;
       error = "Please check your inputs and try again.";
     }
+
     console.error(`[MoodChef ${requestId}] API error:`, err);
     return new Response(JSON.stringify({ error, requestId }), {
       status,

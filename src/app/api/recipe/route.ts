@@ -12,27 +12,30 @@ const schema = z.object({
 
 export async function POST(req: Request) {
   const requestId = Math.random().toString(36).slice(2, 9);
+
   try {
     const body = await req.json();
     const { mood, minutes, ingredients, diet, onlyThese, cuisine } = schema.parse(body);
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-    const system = `You are "MoodChef", a helpful, creative recipe assistant.
-- Fit total time within the given minutes.
+    const system = `You are "MoodChef", a friendly and creative recipe assistant.
+- Fit total prep + cook time within the given minutes.
 - Always use the provided ingredients prominently.
-- If 'onlyThese' is true, avoid adding any other major ingredients (besides pantry staples like salt, oil, pepper, sugar, spices).
-- If 'onlyThese' is false, you may add other *common complementary ingredients* that make sense with the given items.
-- If a cuisine is provided, keep flavours and methods true to that cuisine.
-- Always return valid JSON with title, time_minutes, serves, ingredients_list, steps, why_it_fits, and variation.`;
+- If 'onlyThese' is true, avoid adding other major ingredients (besides pantry staples like salt, pepper, oil, sugar, spices).
+- If 'onlyThese' is false, you may include other common complementary ingredients that make sense with the given items.
+- If a cuisine is provided, stay true to that cuisine’s flavors, naming, and cooking style.
+- Return strictly valid JSON with a "recipes" array containing 3 items.
+- Each recipe must have: title, time_minutes, serves, ingredients_list[], steps[], why_it_fits, variation.`;
 
-    const user = [
+    const brief = [
       `Mood: ${mood}`,
       `Time available: ${minutes} minutes`,
       `Ingredients: ${ingredients}`,
       diet ? `Dietary preference: ${diet}` : "",
       onlyThese ? `Constraint: Use only these ingredients (+ pantry staples)` : "",
       cuisine ? `Cuisine focus: ${cuisine}` : "",
+      `Number of options: 3`,
     ]
       .filter(Boolean)
       .join("\n");
@@ -44,25 +47,31 @@ export async function POST(req: Request) {
         { role: "system", content: system },
         {
           role: "user",
-          content: `Create ONE recipe that fits the brief.
-Return JSON in this format:
+          content: `Create THREE different recipes that fit this brief.
+Return ONLY this JSON shape:
 {
-  "title": "...",
-  "time_minutes": <number>,
-  "serves": <number>,
-  "ingredients_list": ["..."],
-  "steps": ["..."],
-  "why_it_fits": "...",
-  "variation": "..."
+  "recipes": [
+    {
+      "title": "...",
+      "time_minutes": <number>,
+      "serves": <number>,
+      "ingredients_list": ["..."],
+      "steps": ["..."],
+      "why_it_fits": "...",
+      "variation": "..."
+    },
+    { ... },
+    { ... }
+  ]
 }
 
 Brief:
-${user}`,
+${brief}`,
         },
       ],
     });
 
-    const raw = completion.choices[0]?.message?.content?.trim() ?? "{}";
+    const raw = completion.choices[0]?.message?.content?.trim() ?? `{"recipes":[]}`;
     const clean = raw.replace(/```json|```/g, "");
     return new Response(clean, {
       status: 200,
@@ -70,25 +79,19 @@ ${user}`,
     });
   } catch (err: any) {
     const msg = String(err?.message || "").toLowerCase();
-
     let status = 500;
     let error = "Something went wrong. Please try again in a moment.";
 
-    // Quota/limit/paid-plan errors (e.g., 402/429 from a provider)
     if (msg.includes("402") || msg.includes("429") || msg.includes("quota") || msg.includes("limit")) {
       status = 429;
       error = "We’ve hit today’s recipe lookup limit. Please try again later or tweak your inputs.";
     }
-
-    // Bad input / validation problems
     if (msg.includes("zod") || msg.includes("invalid") || msg.includes("parse")) {
       status = 400;
       error = "Please check your inputs and try again.";
     }
 
-    // Never leak upstream/provider messages to end users
     console.error(`[MoodChef ${requestId}] API error:`, err);
-
     return new Response(JSON.stringify({ error, requestId }), {
       status,
       headers: { "Content-Type": "application/json" },

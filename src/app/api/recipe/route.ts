@@ -3,122 +3,107 @@ import { NextRequest } from "next/server";
 import { z } from "zod";
 
 const schema = z.object({
-  mood: z.string().trim().min(1),                 // we’ll just surface mood in “why_it_fits”
+  mood: z.string().trim().min(1),
   minutes: z.coerce.number().int().positive().max(240),
   ingredients: z.string().trim().min(1),
-  diet: z.string().trim().optional(),             // e.g. vegetarian, vegan, gluten free, halal, etc.
+  diet: z.string().trim().optional(), // e.g., vegetarian, vegan, keto, paleo, gluten-free, dairy-free, halal, kosher
 });
 
-const SPOONACULAR = "https://api.spoonacular.com";
-const apiKey = process.env.SPOONACULAR_API_KEY!;
+const SPOON = "https://api.spoonacular.com";
+const API_KEY = process.env.SPOONACULAR_API_KEY!;
 
 export async function POST(req: NextRequest) {
   try {
-    if (!apiKey) {
-      return Response.json({ error: "SPOONACULAR_API_KEY missing" }, { status: 500 });
+    if (!API_KEY) {
+      return json({ error: "SPOONACULAR_API_KEY missing" }, 500);
     }
 
     const body = await req.json();
     const { mood, minutes, ingredients, diet } = schema.parse(body);
 
-    // Parse and normalize ingredients into comma-separated list Spoonacular expects
-    const ingList = ingredients
-      .split(/[,;\n]/)
-      .map(s => s.trim())
-      .filter(Boolean)
-      .slice(0, 20)                                  // keep it reasonable
-      .join(",");
+    const { dietParam, intolerances } = mapDiet(diet);
+    const ingCsv = normIngredientsCSV(ingredients);
 
-    // Map diet string to Spoonacular parameters
-    // For strict vegetarian/vegan/keto/paleo etc. use `diet=...`
-    // For halal/kosher use `intolerances` or rely on tags later (Spoonacular has limited support)
-    const dietParam = normalizeDietToSpoonacular(diet);
-
-    // Step 1: find the best recipe(s) that use the most of your ingredients within time
-    // Endpoint: /recipes/complexSearch
-    const params = new URLSearchParams({
-      apiKey,
-      addRecipeInformation: "true",   // brings back servings, readyInMinutes, summary, etc.
-      fillIngredients: "true",
-      number: "1",                     // just 1 top hit
-      sort: "max-used-ingredients",
-      instructionsRequired: "true",
-      ignorePantry: "true",
-      includeIngredients: ingList,
-      maxReadyTime: String(minutes),
+    // 1) Find candidates that actually use the given ingredients
+    const findParams = new URLSearchParams({
+      apiKey: API_KEY,
+      ingredients: ingCsv,
+      number: "8",          // grab a handful to filter
+      ranking: "1",         // maximize used ingredients
+      ignorePantry: "true", // salt/oil/etc assumed available
     });
 
-    if (dietParam.diet) params.set("diet", dietParam.diet);
-    if (dietParam.intolerances) params.set("intolerances", dietParam.intolerances);
-
-    const searchRes = await fetch(`${SPOONACULAR}/recipes/complexSearch?${params.toString()}`, {
-      headers: { "Content-Type": "application/json" },
-      // Next.js Edge runtime tip: ensure server-side; no caching for now
-      cache: "no-store",
-    });
-
-    if (!searchRes.ok) {
-      const text = await searchRes.text();
-      return Response.json({ error: `Spoonacular search failed: ${searchRes.status} ${text}` }, { status: 502 });
+    const resFind = await fetch(`${SPOON}/recipes/findByIngredients?${findParams}`, { cache: "no-store" });
+    if (!resFind.ok) {
+      const text = await resFind.text();
+      return json({ error: `findByIngredients failed: ${resFind.status} ${text}` }, 502);
     }
 
-    const searchJson = await searchRes.json() as {
-      results: Array<any>;
-      totalResults: number;
-    };
-
-    if (!searchJson.results?.length) {
-      return Response.json({
-        error: "No recipes found that fit your time/ingredients.",
-        hint: "Try reducing restrictions or adding more common ingredients."
-      }, { status: 404 });
+    const candidates: any[] = await resFind.json();
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      return json({ error: "No recipes found with your ingredients." }, 404);
     }
 
-    const hit = searchJson.results[0];
-    const id = hit.id as number;
-
-    // Step 2: get full analyzed instructions for clean step-by-step
-    // Endpoint: /recipes/{id}/analyzedInstructions
-    const instRes = await fetch(`${SPOONACULAR}/recipes/${id}/analyzedInstructions?apiKey=${apiKey}`, {
-      cache: "no-store",
+    // Sort: most used ingredients first, then fewest missed
+    candidates.sort((a, b) => {
+      const usedDiff = (b.usedIngredientCount ?? 0) - (a.usedIngredientCount ?? 0);
+      if (usedDiff !== 0) return usedDiff;
+      return (a.missedIngredientCount ?? 0) - (b.missedIngredientCount ?? 0);
     });
 
-    // Not all recipes have analyzedInstructions; fall back gracefully
+    // 2) Pull /information for each candidate to filter by time & diet
+    const filtered: any[] = [];
+    for (const c of candidates) {
+      const infoUrl = new URL(`${SPOON}/recipes/${c.id}/information`);
+      infoUrl.searchParams.set("apiKey", API_KEY);
+      infoUrl.searchParams.set("includeNutrition", "false");
+      const infoRes = await fetch(infoUrl, { cache: "no-store" });
+      if (!infoRes.ok) continue;
+      const info = await infoRes.json();
+
+      // Time filter
+      const ready = info?.readyInMinutes ?? c.readyInMinutes ?? 999;
+      if (ready > minutes) continue;
+
+      // Diet/intolerance filter (best-effort)
+      if (!passesDiet(info, dietParam, intolerances)) continue;
+
+      filtered.push({ hit: c, info });
+      if (filtered.length >= 3) break; // keep it snappy
+    }
+
+    // If none passed strict filters, relax to top candidate anyway
+    const pick = filtered[0] ?? (candidates.length ? { hit: candidates[0], info: null } : null);
+    if (!pick) {
+      return json({ error: "No suitable recipe matched your time/diet filters." }, 404);
+    }
+
+    // 3) Get nice step-by-step instructions
+    const id = pick.hit.id;
+    const instRes = await fetch(`${SPOON}/recipes/${id}/analyzedInstructions?apiKey=${API_KEY}`, { cache: "no-store" });
     let steps: string[] = [];
     if (instRes.ok) {
-      const inst = await instRes.json() as Array<{ steps: Array<{ number: number; step: string }> }>;
-      if (Array.isArray(inst) && inst.length && Array.isArray(inst[0].steps)) {
-        steps = inst[0].steps.map(s => s.step.trim()).filter(Boolean);
+      const inst = await instRes.json();
+      if (Array.isArray(inst) && inst.length && Array.isArray(inst[0]?.steps)) {
+        steps = inst[0].steps.map((s: any) => (s?.step ?? "").toString().trim()).filter(Boolean);
       }
     }
 
-    // Build a consistent response shape for your UI
-    const title: string = hit.title ?? "Recipe";
-    const time_minutes: number = hit.readyInMinutes ?? Math.min(minutes, 60);
-    const serves: number = hit.servings ?? 2;
+    const info = pick.info;
+    const title = info?.title ?? pick.hit.title ?? "Recipe";
+    const time_minutes = Math.min(info?.readyInMinutes ?? pick.hit.readyInMinutes ?? minutes, minutes);
+    const serves = info?.servings ?? 2;
 
-    // Prefer “missedIngredients + usedIngredients” from search hit (already filled if fillIngredients=true)
-    const ingredients_list: string[] = collectIngredients(hit);
-
-    // If steps were empty, try to derive from summary/instructions fields
+    const ingredients_list = buildIngredientList(pick.hit, info);
     if (steps.length === 0) {
-      const fallback = extractStepsFromHtml(hit.summary || hit.instructions || "");
-      if (fallback.length) steps = fallback;
-      // still empty? at least provide a single-instruction fallback
-      if (steps.length === 0) steps = ["Follow the instructions on the recipe page."];
+      const fallback = extractStepsFromHtml(info?.summary || info?.instructions || "");
+      steps = fallback.length ? fallback : ["Open the linked recipe page and follow the instructions."];
     }
 
-    const why_it_fits = [
-      mood ? `Matches your mood: ${mood}.` : "",
-      `Fits your time (~${time_minutes} min).`,
-      ingList ? `Uses your ingredients: ${ingList.split(",").slice(0,5).join(", ")}${ingList.split(",").length>5?"…":""}.` : "",
-      diet ? `Diet preference: ${diet}.` : ""
-    ].filter(Boolean).join(" ");
+    const why_it_fits = buildWhy(mood, time_minutes, ingCsv, diet);
+    const variation = buildVariation(pick.hit, info);
 
-    // quick variation suggestion using missed ingredients or cuisine tags if available
-    const variation = craftVariation(hit);
-
-    return Response.json({
+    return json({
       title,
       time_minutes,
       serves,
@@ -126,21 +111,37 @@ export async function POST(req: NextRequest) {
       steps,
       why_it_fits,
       variation,
-    }, { status: 200 });
+    });
 
   } catch (err: any) {
-    return Response.json({ error: err?.message ?? "Bad Request" }, { status: 400 });
+    return json({ error: err?.message ?? "Bad Request" }, 400);
   }
 }
 
-// ---------- helpers ----------
+/* ---------------- helpers ---------------- */
 
-function normalizeDietToSpoonacular(raw?: string) {
-  if (!raw) return { diet: "", intolerances: "" };
+function json(obj: any, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function normIngredientsCSV(s: string) {
+  return s
+    .split(/[,;\n ]+/) // split by comma/semicolon/newline/space
+    .map(v => v.trim())
+    .filter(Boolean)
+    .slice(0, 20)
+    .join(",");
+}
+
+function mapDiet(raw?: string): { dietParam: string; intolerances: string[] } {
+  if (!raw) return { dietParam: "", intolerances: [] };
   const s = raw.toLowerCase();
 
-  // Map common strings to Spoonacular diet param
-  const knownDiet =
+  // Spoonacular "diet" enum
+  const dietParam =
     s.includes("vegan") ? "vegan" :
     s.includes("vegetarian") ? "vegetarian" :
     s.includes("pescatarian") ? "pescetarian" :
@@ -148,10 +149,9 @@ function normalizeDietToSpoonacular(raw?: string) {
     s.includes("paleo") ? "paleo" :
     s.includes("low fodmap") ? "low FODMAP" :
     s.includes("whole30") ? "whole30" :
-    s.includes("gluten") && s.includes("free") ? "" : // goes to intolerance instead
     "";
 
-  // intolerances: comma-separated (gluten, dairy, peanut, sesame, etc.)
+  // Intolerances (Spoonacular recognized)
   const intolerances: string[] = [];
   if (s.includes("gluten")) intolerances.push("gluten");
   if (s.includes("dairy") || s.includes("lactose")) intolerances.push("dairy");
@@ -164,51 +164,89 @@ function normalizeDietToSpoonacular(raw?: string) {
   if (s.includes("shellfish")) intolerances.push("shellfish");
   if (s.includes("treenut") || s.includes("tree nut")) intolerances.push("tree nut");
 
-  // “halal/kosher” don’t have first-class filters; you may post-filter by `dishTypes`/`cuisines`
-  return {
-    diet: knownDiet,
-    intolerances: intolerances.join(","),
-  };
+  return { dietParam, intolerances };
 }
 
-function collectIngredients(hit: any): string[] {
+function passesDiet(info: any, dietParam: string, intolerances: string[]): boolean {
+  if (!info) return true;
+
+  // Basic booleans from /information
+  if (dietParam === "vegan" && info.vegan === false) return false;
+  if (dietParam === "vegetarian" && info.vegetarian === false) return false;
+  if (dietParam === "pescetarian" && !hasDiet(info, "pescatarian")) return false;
+  if (dietParam === "ketogenic" && !hasDiet(info, "ketogenic")) return false;
+  if (dietParam === "paleo" && !hasDiet(info, "paleo")) return false;
+  if (dietParam === "low FODMAP" && !hasDiet(info, "low fodmap")) return false;
+  if (dietParam === "whole30" && !hasDiet(info, "whole 30")) return false;
+
+  // Intolerances best-effort check via extendedIngredients
+  if (Array.isArray(info.extendedIngredients) && intolerances.length) {
+    const lowerList = info.extendedIngredients.map((i: any) =>
+      (i?.original ?? i?.name ?? "").toString().toLowerCase()
+    );
+    for (const t of intolerances) {
+      // extremely rough matching to signal likely conflicts
+      if (t === "gluten" && lowerList.some((x: string) => /(wheat|barley|rye|farro|spelt|semolina|bulgur)/.test(x))) return false;
+      if (t === "dairy" && lowerList.some((x: string) => /(milk|cheese|butter|cream|yogurt)/.test(x))) return false;
+      if (t === "peanut" && lowerList.some((x: string) => /\bpeanut\b/.test(x))) return false;
+      if (t === "sesame" && lowerList.some((x: string) => /\bsesame\b/.test(x))) return false;
+      if (t === "soy" && lowerList.some((x: string) => /\bsoy\b|\bsoya\b|\btofu\b/.test(x))) return false;
+      if (t === "egg" && lowerList.some((x: string) => /\begg\b/.test(x))) return false;
+      if (t === "wheat" && lowerList.some((x: string) => /\bwheat\b/.test(x))) return false;
+      if (t === "shellfish" && lowerList.some((x: string) => /(shrimp|prawn|crab|lobster|clam|mussel|oyster)/.test(x))) return false;
+      if (t === "tree nut" && lowerList.some((x: string) => /(almond|walnut|cashew|pistachio|pecan|hazelnut|macadamia)/.test(x))) return false;
+    }
+  }
+  return true;
+}
+
+function hasDiet(info: any, key: string): boolean {
+  const diets: string[] = info?.diets ?? [];
+  return diets.some(d => d.toLowerCase() === key.toLowerCase());
+}
+
+function buildIngredientList(hit: any, info: any): string[] {
   const out: string[] = [];
   const push = (arr?: any[]) => {
     if (Array.isArray(arr)) {
       for (const i of arr) {
-        const name = i?.original ?? i?.name ?? i?.originalName;
+        const name = i?.original ?? i?.originalString ?? i?.name ?? i?.originalName;
         if (name && !out.includes(name)) out.push(name);
       }
     }
   };
-  push(hit.usedIngredients);
-  push(hit.missedIngredients);
-  // Sometimes addRecipeInformation gives extendedIngredients
-  push(hit.extendedIngredients);
+  push(hit?.usedIngredients);
+  push(hit?.missedIngredients);
+  push(info?.extendedIngredients);
   return out.length ? out : [];
 }
 
 function extractStepsFromHtml(html: string): string[] {
   if (!html) return [];
-  // quick & dirty: strip tags and split sentences
   const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-  // split on numbered bullet hints or sentences
-  const parts = text.split(/(?:(?:Step|步骤|Étape)\s*\d+[:.-]\s*)|(?<=\.)\s+/i)
+  const parts = text
+    .split(/(?:(?:Step|Étape|Paso)\s*\d+[:.)-]\s*)|(?<=\.)\s+/i)
     .map(s => s.trim())
-    .filter(s => s && s.length > 6);
-  // Cap at ~10 steps
+    .filter(s => s.length > 6);
   return parts.slice(0, 10);
 }
 
-function craftVariation(hit: any): string {
-  // simple heuristics from cuisines/dishTypes/missedIngredients
-  const cuisines: string[] = hit.cuisines ?? [];
-  const dish: string[] = hit.dishTypes ?? [];
-  const missed = (hit.missedIngredients ?? []).map((m: any) => m.original).filter(Boolean);
+function buildWhy(mood: string, time: number, ingCsv: string, diet?: string) {
+  const top = ingCsv.split(",").slice(0, 5).join(", ");
+  const more = ingCsv.split(",").length > 5 ? "…" : "";
+  return [
+    `Matches your mood: ${mood}.`,
+    `Fits your time (~${time} min).`,
+    ingCsv ? `Uses your ingredients: ${top}${more}.` : "",
+    diet ? `Diet preference: ${diet}.` : "",
+  ].filter(Boolean).join(" ");
+}
 
-  if (missed.length) {
-    return `Try adding ${missed.slice(0, 2).join(", ")} for extra flavor.`;
-  }
+function buildVariation(hit: any, info: any) {
+  const missed = (hit?.missedIngredients ?? []).map((m: any) => m?.original).filter(Boolean);
+  if (missed.length) return `Try adding ${missed.slice(0, 2).join(", ")} for extra flavor.`;
+  const cuisines: string[] = info?.cuisines ?? [];
+  const dish: string[] = info?.dishTypes ?? [];
   if (cuisines.includes("Italian")) return "Variation: add chilli flakes and a splash of pasta water for gloss.";
   if (cuisines.includes("Mexican")) return "Variation: finish with lime juice and fresh coriander.";
   if (dish.includes("salad")) return "Variation: toss with toasted nuts or seeds for crunch.";

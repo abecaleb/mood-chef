@@ -1,3 +1,6 @@
+export const runtime = "edge";
+export const preferredRegion = ["syd1", "sin1", "hnd1"]; // Sydney, Singapore, Tokyo (fast for AU)
+
 import { z } from "zod";
 import OpenAI from "openai";
 
@@ -19,58 +22,46 @@ export async function POST(req: Request) {
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-    const system = `You are "MoodChef", a friendly and creative recipe assistant.
-- Fit total prep + cook time within the given minutes.
+    // Tighter, faster prompt
+    const system = `You are "MoodChef", a friendly, creative recipe assistant.
+- Fit total prep+cook within the given minutes.
 - Always use the provided ingredients prominently.
-- If 'onlyThese' is true, avoid adding other major ingredients (besides pantry staples like salt, pepper, oil, sugar, spices).
-- If 'onlyThese' is false, you may include other common complementary ingredients that make sense with the given items.
-- If a cuisine is provided, stay true to that cuisine’s flavors, naming, and cooking style.
-- Return strictly valid JSON with a "recipes" array containing 3 items.
-- Each recipe must have: title, time_minutes, serves, ingredients_list[], steps[], why_it_fits, variation.`;
+- If 'onlyThese' is true, avoid other major ingredients (besides pantry staples like salt, oil, pepper, sugar, common spices).
+- If 'onlyThese' is false, you MAY add a few common complementary ingredients.
+- If a cuisine is provided, stay true to that cuisine’s flavor & method.
+- Return STRICT JSON: {"recipes":[{title,time_minutes,serves,ingredients_list[],steps[],why_it_fits,variation}, ...]} with EXACTLY 2 items.
+- Keep steps concise (≤6) and ingredient names short.`;
 
     const brief = [
       `Mood: ${mood}`,
       `Time available: ${minutes} minutes`,
       `Ingredients: ${ingredients}`,
       diet ? `Dietary preference: ${diet}` : "",
-      onlyThese ? `Constraint: Use only these ingredients (+ pantry staples)` : "",
+      onlyThese ? `Constraint: Use ONLY these ingredients (+ pantry staples)` : "",
       cuisine ? `Cuisine focus: ${cuisine}` : "",
-      `Number of options: 3`,
     ]
       .filter(Boolean)
       .join("\n");
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
-      temperature: 0.8,
+      temperature: 0.7,
+      response_format: { type: "json_object" }, // nudge strict JSON
+      max_tokens: 600, // smaller, faster
       messages: [
         { role: "system", content: system },
         {
           role: "user",
-          content: `Create THREE different recipes that fit this brief.
-Return ONLY this JSON shape:
-{
-  "recipes": [
-    {
-      "title": "...",
-      "time_minutes": <number>,
-      "serves": <number>,
-      "ingredients_list": ["..."],
-      "steps": ["..."],
-      "why_it_fits": "...",
-      "variation": "..."
-    },
-    { ... },
-    { ... }
-  ]
-}
-
-Brief:
-${brief}`,
+          content:
+            `Create EXACTLY TWO different recipes that fit this brief.\n` +
+            `Return ONLY this JSON shape (no commentary):\n` +
+            `{"recipes":[{"title":"...","time_minutes":30,"serves":2,"ingredients_list":["..."],"steps":["..."],"why_it_fits":"...","variation":"..."} , {...}]}\n\n` +
+            `Brief:\n${brief}`,
         },
       ],
     });
 
+    // Clean any accidental code-fences (belt & braces)
     const raw = completion.choices[0]?.message?.content?.trim() ?? `{"recipes":[]}`;
     const clean = raw.replace(/```json|```/g, "");
     return new Response(clean, {

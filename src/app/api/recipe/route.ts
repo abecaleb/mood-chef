@@ -2,22 +2,37 @@
 import { NextRequest } from "next/server";
 import { z } from "zod";
 
+// ADD onlyThese (default false)
 const schema = z.object({
   mood: z.string().trim().min(1),
   minutes: z.coerce.number().int().positive().max(240),
   ingredients: z.string().trim().min(1),
   diet: z.string().trim().optional(),
+  onlyThese: z.boolean().optional().default(false), // NEW
 });
 
 const SPOON = "https://api.spoonacular.com";
 const API_KEY = process.env.SPOONACULAR_API_KEY!;
+
+// Pantry staples that don't disqualify a recipe if "onlyThese" is checked.
+// You can edit this list to taste.
+const PANTRY = [
+  "salt","sea salt","kosher salt","pepper","black pepper","chilli","chili","chilli flakes","red pepper flakes",
+  "oil","olive oil","vegetable oil","canola oil","sunflower oil","ghee",
+  "sugar","brown sugar","caster sugar","granulated sugar",
+  "vinegar","white vinegar","apple cider vinegar","balsamic vinegar","rice vinegar",
+  "soy sauce","tamari","fish sauce","oyster sauce",
+  "garlic","ginger",
+  "flour","all purpose flour","cornstarch","baking powder","baking soda",
+  "butter","water","stock","broth","lemon","lime"
+].map((s) => s.toLowerCase());
 
 export async function POST(req: NextRequest) {
   try {
     if (!API_KEY) return json({ error: "SPOONACULAR_API_KEY missing" }, 500);
 
     const body = await req.json();
-    const { mood, minutes, ingredients, diet } = schema.parse(body);
+    const { mood, minutes, ingredients, diet, onlyThese } = schema.parse(body);
 
     const ingCsv = normIngredientsCSV(ingredients);
     const userIngsRaw = splitCsv(ingCsv);
@@ -25,15 +40,14 @@ export async function POST(req: NextRequest) {
 
     const { dietParam, intolerances } = mapDiet(diet);
 
-    // 1) Find recipes that ACTUALLY use the given ingredients
+    // 1) Find candidates
     const findParams = new URLSearchParams({
       apiKey: API_KEY,
       ingredients: ingCsv,
-      number: "16",
-      ranking: "1",          // maximize used ingredients
+      number: "20",
+      ranking: "1",
       ignorePantry: "true",
     });
-
     const resFind = await fetch(`${SPOON}/recipes/findByIngredients?${findParams}`, { cache: "no-store" });
     if (!resFind.ok) {
       const text = await resFind.text();
@@ -44,38 +58,30 @@ export async function POST(req: NextRequest) {
       return json({ error: "No recipes found with your ingredients." }, 404);
     }
 
-    // Compute overlap count (how many of the user’s items are used)
+    // Overlap scoring
     candidates = candidates.map(r => {
-      const used = (r.usedIngredients ?? [])
-        .map((i: any) => normalizeIng(i.name ?? i.original ?? ""));
+      const used = (r.usedIngredients ?? []).map((i: any) => normalizeIng(i.name ?? i.original ?? ""));
       const overlap = userIngs.filter(i => used.includes(i));
       return { ...r, overlapCount: overlap.length, _overlapSet: new Set(overlap) };
     });
 
-    // Prefer recipes that use ALL inputs first; then fall back to ≥2
-    const requireAll = userIngs.length >= 2; // with 3 provided, require all 3 first
-    let strict = requireAll
-      ? candidates.filter(r => r.overlapCount === userIngs.length)
-      : candidates.filter(r => r.overlapCount >= 1);
+    // Prefer ALL, then ≥2, else fallback
+    let ranked = candidates.filter(r => r.overlapCount === userIngs.length);
+    if (ranked.length === 0) ranked = candidates.filter(r => r.overlapCount >= Math.min(2, userIngs.length));
+    if (ranked.length === 0) ranked = candidates;
 
-    // If none use all, fall back to ≥2; if still none, fall back to original ranking
-    if (strict.length === 0) strict = candidates.filter(r => r.overlapCount >= Math.min(2, userIngs.length));
-    if (strict.length === 0) strict = candidates;
-
-    // Rank: most overlap, then fewest missed, then most used
-    strict.sort((a, b) =>
+    ranked.sort((a, b) =>
       (b.overlapCount - a.overlapCount) ||
       ((a.missedIngredientCount ?? 0) - (b.missedIngredientCount ?? 0)) ||
       ((b.usedIngredientCount ?? 0) - (a.usedIngredientCount ?? 0))
     );
 
-    // 2) Pull /information for top few and filter by time + diet/intolerances
+    // 2) Info + filters (time/diet) and NEW: onlyThese => filter missed ingredients
     const finalists: { hit: any; info: any }[] = [];
-    for (const c of strict.slice(0, 8)) {
+    for (const c of ranked.slice(0, 10)) {
       const infoUrl = new URL(`${SPOON}/recipes/${c.id}/information`);
       infoUrl.searchParams.set("apiKey", API_KEY);
       infoUrl.searchParams.set("includeNutrition", "false");
-
       const infoRes = await fetch(infoUrl, { cache: "no-store" });
       if (!infoRes.ok) continue;
       const info = await infoRes.json();
@@ -84,14 +90,26 @@ export async function POST(req: NextRequest) {
       if (ready > minutes) continue;
       if (!passesDiet(info, dietParam, intolerances)) continue;
 
+      if (onlyThese) {
+        const nonPantryMiss = (c.missedIngredients ?? [])
+          .map((m: any) => (m?.original ?? m?.name ?? "").toString().toLowerCase())
+          .filter((n: string) => !isPantry(n));
+        if (nonPantryMiss.length > 0) continue; // reject if anything beyond pantry is missing
+      }
+
       finalists.push({ hit: c, info });
       if (finalists.length >= 3) break;
     }
 
-    const pick = finalists[0] ?? { hit: strict[0], info: null };
-    if (!pick) return json({ error: "No suitable recipe matched your filters." }, 404);
+    const pick = finalists[0] ?? { hit: ranked[0], info: null };
+    if (!pick) {
+      return json(
+        { error: "No suitable recipe matched your filters.", hint: onlyThese ? "Try unchecking 'only these ingredients' or add one more ingredient." : undefined },
+        404
+      );
+    }
 
-    // 3) Nice step-by-step instructions
+    // 3) Instructions
     const id = pick.hit.id;
     const instRes = await fetch(`${SPOON}/recipes/${id}/analyzedInstructions?apiKey=${API_KEY}`, { cache: "no-store" });
 
@@ -105,30 +123,22 @@ export async function POST(req: NextRequest) {
 
     const info = pick.info;
     const baseTitle: string = info?.title ?? pick.hit.title ?? "Recipe";
-
-    // === HERO TITLE: front-load user's ingredients ===
     const usedSet = new Set<string>((pick.hit.usedIngredients ?? []).map((i: any) => normalizeIng(i.name ?? i.original ?? "")));
-    const heroParts = userIngsRaw
-      .filter((_, idx) => usedSet.has(userIngs[idx])) // keep only those actually used
-      .map(titleCase);
+    const heroParts = userIngsRaw.filter((_, i) => usedSet.has(userIngs[i])).map(titleCase);
     const heroPrefix = heroParts.length ? `${heroParts.join(" • ")} — ` : "";
     const title = `${heroPrefix}${baseTitle}`;
 
     const time_minutes: number = Math.min(info?.readyInMinutes ?? pick.hit.readyInMinutes ?? minutes, minutes);
     const serves: number = info?.servings ?? 2;
 
-    // Ingredients list: put user's ingredients first
-    const ingredients_list = orderIngredientsForHero(
-      buildIngredientList(pick.hit, info),
-      userIngs
-    );
+    const ingredients_list = orderIngredientsForHero(buildIngredientList(pick.hit, info), userIngs);
 
     if (steps.length === 0) {
       const fallback = extractStepsFromHtml(info?.summary || info?.instructions || "");
       steps = fallback.length ? fallback : ["Open the linked recipe page and follow the instructions."];
     }
 
-    const why_it_fits = buildWhy(mood, time_minutes, ingCsv, diet, pick.hit, userIngs.length);
+    const why_it_fits = buildWhy(mood, time_minutes, ingCsv, diet, pick.hit, userIngs.length, onlyThese);
     const variation = buildVariation(pick.hit, info);
 
     return json({ title, time_minutes, serves, ingredients_list, steps, why_it_fits, variation });
@@ -152,7 +162,7 @@ function splitCsv(csv: string) {
 
 function normIngredientsCSV(s: string) {
   return s
-    .split(/[,;\n ]+/) // commas, semicolons, newlines, spaces
+    .split(/[,;\n ]+/)
     .map(v => v.trim())
     .filter(Boolean)
     .slice(0, 20)
@@ -160,12 +170,18 @@ function normIngredientsCSV(s: string) {
 }
 
 function normalizeIng(s: string) {
-  // crude singularization + lowercase for better matching ("potatoes" -> "potato")
   return s.toLowerCase().replace(/[^a-z\s]/g, "").replace(/(es|s)\b/g, "").trim();
 }
 
 function titleCase(s: string) {
   return s.replace(/\b[a-z]/g, m => m.toUpperCase());
+}
+
+function isPantry(name: string) {
+  const n = name.toLowerCase();
+  if (PANTRY.includes(n)) return true;
+  // loose matching for phrases like "extra virgin olive oil", "black pepper"
+  return PANTRY.some(p => n.includes(p));
 }
 
 function mapDiet(raw?: string): { dietParam: string; intolerances: string[] } {
@@ -199,7 +215,6 @@ function mapDiet(raw?: string): { dietParam: string; intolerances: string[] } {
 
 function passesDiet(info: any, dietParam: string, intolerances: string[]): boolean {
   if (!info) return true;
-
   if (dietParam === "vegan" && info.vegan === false) return false;
   if (dietParam === "vegetarian" && info.vegetarian === false) return false;
   if (dietParam === "pescetarian" && !hasDiet(info, "pescatarian")) return false;
@@ -249,7 +264,6 @@ function buildIngredientList(hit: any, info: any): string[] {
 }
 
 function orderIngredientsForHero(list: string[], userIngsNorm: string[]) {
-  // bring user's ingredients (in any form) to the top
   const norm = (s: string) => normalizeIng(s);
   const isUser = (s: string) => userIngsNorm.includes(norm(s));
   const users = list.filter(isUser);
@@ -271,11 +285,18 @@ function extractStepsFromHtml(html: string): string[] {
   return parts.slice(0, 10);
 }
 
-function buildWhy(mood: string, time: number, ingCsv: string, diet?: string, hit?: any, totalProvided?: number) {
+function buildWhy(
+  mood: string,
+  time: number,
+  ingCsv: string,
+  diet?: string,
+  hit?: any,
+  totalProvided?: number,
+  onlyThese?: boolean
+) {
   const ingArr = splitCsv(ingCsv);
   const top = ingArr.slice(0, 5).join(", ");
   const more = ingArr.length > 5 ? "…" : "";
-
   const usedCount = hit?.overlapCount ?? hit?.usedIngredientCount ?? 0;
   const total = totalProvided ?? ingArr.length;
 
@@ -284,6 +305,7 @@ function buildWhy(mood: string, time: number, ingCsv: string, diet?: string, hit
     `Fits your time (~${time} min).`,
     `Uses ${usedCount}/${total} of your ingredients: ${top}${more}.`,
     diet ? `Diet preference: ${diet}.` : "",
+    onlyThese ? `Only-these mode: allowing pantry staples only.` : "",
   ].filter(Boolean).join(" ");
 }
 

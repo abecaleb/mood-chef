@@ -1,3 +1,4 @@
+// src/components/NavBar.tsx
 "use client";
 
 import Link from "next/link";
@@ -7,7 +8,7 @@ import { supabase } from "@/lib/supabaseClient";
 
 export default function NavBar() {
   const [userEmail, setUserEmail] = useState<string | null>(null);
-  const [favCount, setFavCount] = useState<number | null>(null);
+  const [favCount, setFavCount] = useState<number>(0);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -23,14 +24,26 @@ export default function NavBar() {
           .eq("user_id", u.id);
         setFavCount(count ?? 0);
       } else {
-        setFavCount(null);
+        setFavCount(0);
       }
     }
     load();
 
-    // Update on auth state changes
+    // update on auth changes
     const { data: sub } = supabase.auth.onAuthStateChange(() => load());
-    return () => sub.subscription.unsubscribe();
+
+    // listen for save events to bump the badge instantly
+    const onFavSaved = () => setFavCount((c) => c + 1);
+    if (typeof window !== "undefined") {
+      window.addEventListener("favorite:saved", onFavSaved);
+    }
+
+    return () => {
+      sub.subscription.unsubscribe();
+      if (typeof window !== "undefined") {
+        window.removeEventListener("favorite:saved", onFavSaved);
+      }
+    };
   }, []);
 
   const signIn = async () => {
@@ -62,7 +75,6 @@ export default function NavBar() {
   return (
     <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/80 backdrop-blur">
       <div className="mx-auto flex h-14 max-w-5xl items-center justify-between px-4">
-        {/* Left: Logo + Brand */}
         <Link href="/" className="flex items-center gap-2">
           <Image
             src="/moodchef-logo.svg"
@@ -77,20 +89,20 @@ export default function NavBar() {
           </span>
         </Link>
 
-        {/* Right: Nav actions */}
         <nav className="flex items-center gap-3">
-          <Link
-            href="/saved"
-            className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800 hover:border-amber-300"
-            title="View saved recipes"
-          >
-            <span>Saved</span>
-            {favCount !== null && (
+          {/* Only show Saved when signed in */}
+          {userEmail && (
+            <Link
+              href="/saved"
+              className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-800 hover:border-amber-300"
+              title="View saved recipes"
+            >
+              <span>Saved</span>
               <span className="rounded-md bg-amber-500 px-1.5 py-0.5 text-xs font-semibold text-white">
                 {favCount}
               </span>
-            )}
-          </Link>
+            </Link>
+          )}
 
           {userEmail ? (
             <button
